@@ -15,12 +15,14 @@ import android.graphics.RectF;
 import android.graphics.Shader;
 import android.util.LruCache;
 import android.view.MotionEvent;
+import android.view.ScaleGestureDetector;
 import android.view.VelocityTracker;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.animation.AccelerateDecelerateInterpolator;
 import android.view.animation.DecelerateInterpolator;
 
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -87,6 +89,16 @@ final class FlipView extends View {
     private float downX, downY, t0;
     private VelocityTracker vt;
 
+    // zoom
+    private float zoom = 1f, panX, panY;
+    private final HashMap<Integer, Bitmap> hi = new HashMap<>();
+    private int hiScale, hiGen;
+    private ScaleGestureDetector sgd;
+    private ValueAnimator zoomAnim;
+    private long lastTapT;
+    private float lastTapX, lastTapY, lastX, lastY;
+    private static final int M_PAN = 3;
+
     // drawing
     private final CurlGeometry geo = new CurlGeometry();
     private final Paint bmpPaint = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
@@ -107,6 +119,24 @@ final class FlipView extends View {
         density = c.getResources().getDisplayMetrics().density;
         slop = ViewConfiguration.get(c).getScaledTouchSlop();
         flingMin = 700f * density;
+        sgd = new ScaleGestureDetector(c, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            @Override
+            public boolean onScaleBegin(ScaleGestureDetector d) {
+                return anim == null && leaf < 0 && src != null;
+            }
+
+            @Override
+            public boolean onScale(ScaleGestureDetector d) {
+                applyZoom(zoom * d.getScaleFactor(), d.getFocusX(), d.getFocusY());
+                return true;
+            }
+
+            @Override
+            public void onScaleEnd(ScaleGestureDetector d) {
+                if (zoom < 1.05f) resetZoom();
+                else requestHi();
+            }
+        });
         stroke.setStyle(Paint.Style.STROKE);
         line.setStyle(Paint.Style.STROKE);
     }
@@ -137,6 +167,7 @@ final class FlipView extends View {
 
     void setSource(PageSource source, int startPage) {
         cancelAnim();
+        resetZoom();
         leaf = -1;
         src = source;
         n = source == null ? 0 : source.pageCount();
@@ -175,6 +206,7 @@ final class FlipView extends View {
     }
 
     void next() {
+        resetZoom();
         if (src == null || anim != null || s >= maxS) return;
         bottom = true;
         fingerDy = 0;
@@ -182,6 +214,7 @@ final class FlipView extends View {
     }
 
     void prev() {
+        resetZoom();
         if (src == null || anim != null || s <= 0) return;
         bottom = true;
         fingerDy = 0;
@@ -190,6 +223,7 @@ final class FlipView extends View {
 
     void release() {
         cancelAnim();
+        resetZoom();
         exec.shutdownNow();
         clearCache();
     }
@@ -228,6 +262,7 @@ final class FlipView extends View {
             wantPage = curPage;
             laidOut = true;
         }
+        resetZoom();
         float margin = 10 * density;
         float aw = w - insL - insR - 2 * margin;
         float ah = h - insT - insB - 2 * margin;
@@ -343,7 +378,14 @@ final class FlipView extends View {
     protected void onDraw(Canvas c) {
         c.drawColor(bg);
         if (src == null || n == 0 || slotW <= 0 || !laidOut) return;
-        if (leaf >= 0 && t > 0.002f && t < 0.998f) {
+        if (zoom > 1.001f && leaf < 0) {
+            c.save();
+            c.translate(spread.centerX() + panX, spread.centerY() + panY);
+            c.scale(zoom, zoom);
+            c.translate(-spread.centerX(), -spread.centerY());
+            drawStatic(c, s);
+            c.restore();
+        } else if (leaf >= 0 && t > 0.002f && t < 0.998f) {
             drawFlip(c, leaf, t);
         } else {
             drawStatic(c, leaf >= 0 ? (t >= 0.998f ? leaf + 1 : leaf) : s);
@@ -357,7 +399,9 @@ final class FlipView extends View {
 
     private void drawPage(Canvas c, int page, RectF dst) {
         if (page < 0 || page >= n) return;
-        Bitmap b = bitmap(page);
+        Bitmap b = null;
+        if (zoom > 1.001f && hiScale > 1) b = hi.get(page);
+        if (b == null) b = bitmap(page);
         if (b != null) {
             c.drawBitmap(b, null, dst, bmpPaint);
         } else {
@@ -543,6 +587,111 @@ final class FlipView extends View {
         return paper;
     }
 
+    // ------------------------------------------------------------------ zoom
+
+    private void clampPan() {
+        float zw = spread.width() * zoom, zh = spread.height() * zoom;
+        float w = getWidth(), h = getHeight();
+        float cx = spread.centerX(), cy = spread.centerY();
+        if (zw <= w) panX = w / 2f - cx;
+        else panX = Math.max(w - cx - zw / 2f, Math.min(zw / 2f - cx, panX));
+        if (zh <= h) panY = h / 2f - cy;
+        else panY = Math.max(h - cy - zh / 2f, Math.min(zh / 2f - cy, panY));
+    }
+
+    /** Sets the zoom keeping the point (fx, fy) of the screen fixed. */
+    private void applyZoom(float nz, float fx, float fy) {
+        nz = Math.max(1f, Math.min(4f, nz));
+        float k = nz / zoom;
+        float cx = spread.centerX(), cy = spread.centerY();
+        panX = (fx - cx) - (fx - cx - panX) * k;
+        panY = (fy - cy) - (fy - cy - panY) * k;
+        zoom = nz;
+        clampPan();
+        invalidate();
+    }
+
+    private void resetZoom() {
+        if (zoomAnim != null) {
+            zoomAnim.cancel();
+            zoomAnim = null;
+        }
+        zoom = 1f;
+        panX = panY = 0f;
+        hiGen++;
+        hiScale = 0;
+        hi.clear();
+    }
+
+    private void animateZoom(final float target, final float fx, final float fy) {
+        if (zoomAnim != null) zoomAnim.cancel();
+        final float from = zoom;
+        zoomAnim = ValueAnimator.ofFloat(from, target);
+        zoomAnim.setDuration(220);
+        zoomAnim.addUpdateListener(a -> applyZoom((float) a.getAnimatedValue(), fx, fy));
+        zoomAnim.addListener(new AnimatorListenerAdapter() {
+            private boolean cancelled;
+
+            @Override
+            public void onAnimationCancel(Animator animation) {
+                cancelled = true;
+            }
+
+            @Override
+            public void onAnimationEnd(Animator animation) {
+                if (cancelled) return;
+                zoomAnim = null;
+                if (target <= 1.01f) resetZoom();
+                else requestHi();
+                invalidate();
+            }
+        });
+        zoomAnim.start();
+    }
+
+    /** Renders the visible page(s) again at a higher resolution so zoomed text stays sharp. */
+    private void requestHi() {
+        if (src == null || zoom < 1.05f || slotW <= 0) return;
+        int sc = Math.min(4, (int) Math.ceil(zoom));
+        while (sc > 1 && (long) slotW * sc * slotH * sc * 4 > 32L * 1024 * 1024) sc--;
+        if (sc <= 1) return;
+        if (sc != hiScale) {
+            hi.clear();
+            hiScale = sc;
+            hiGen++;
+        }
+        final int g = hiGen, w = slotW * sc, h = slotH * sc;
+        final PageSource source = src;
+        int[] pages = dbl ? new int[]{2 * s - 1, 2 * s} : new int[]{s};
+        for (final int page : pages) {
+            if (page < 0 || page >= n || hi.containsKey(page)) continue;
+            hi.put(page, null);
+            try {
+                exec.execute(() -> {
+                    Bitmap b = null;
+                    if (g == hiGen) {
+                        try {
+                            b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                            source.render(page, b);
+                        } catch (Throwable e) {
+                            b = null;
+                        }
+                    }
+                    final Bitmap fb = b;
+                    post(() -> {
+                        if (g == hiGen) {
+                            if (fb != null) hi.put(page, fb);
+                            else hi.remove(page);
+                            invalidate();
+                        }
+                    });
+                });
+            } catch (Exception rejected) {
+                hi.remove(page);
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ animation / state
 
     private void cancelAnim() {
@@ -589,6 +738,7 @@ final class FlipView extends View {
     }
 
     private void commit(boolean notify) {
+        resetZoom();
         curPage = pageOfSpread(s);
         wantPage = curPage;
         prefetch();
@@ -601,10 +751,16 @@ final class FlipView extends View {
     @Override
     public boolean onTouchEvent(MotionEvent e) {
         if (src == null || !laidOut) return false;
+        sgd.onTouchEvent(e);
+        if (sgd.isInProgress() || e.getPointerCount() > 1) {
+            if (mode == M_DRAG) animate(leaf, t, t0, false);
+            mode = M_IGNORE;
+            return true;
+        }
         switch (e.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
-                downX = e.getX();
-                downY = e.getY();
+                downX = lastX = e.getX();
+                downY = lastY = e.getY();
                 mode = anim != null ? M_IGNORE : M_NONE;
                 if (vt != null) vt.recycle();
                 vt = VelocityTracker.obtain();
@@ -612,9 +768,16 @@ final class FlipView extends View {
                 return true;
             case MotionEvent.ACTION_MOVE:
                 if (vt != null) vt.addMovement(e);
-                if (mode == M_NONE) {
+                if (mode == M_PAN) {
+                    panX += e.getX() - lastX;
+                    panY += e.getY() - lastY;
+                    clampPan();
+                    invalidate();
+                } else if (mode == M_NONE) {
                     float dx = e.getX() - downX, dy = e.getY() - downY;
-                    if (Math.abs(dx) > slop && Math.abs(dx) > Math.abs(dy) * 0.7f) {
+                    if (zoom > 1.01f) {
+                        if (Math.abs(dx) > slop || Math.abs(dy) > slop) mode = M_PAN;
+                    } else if (Math.abs(dx) > slop && Math.abs(dx) > Math.abs(dy) * 0.7f) {
                         if (dx < 0 && s < maxS) {
                             leaf = s;
                             t0 = 0f;
@@ -638,6 +801,8 @@ final class FlipView extends View {
                     fingerDy = e.getY() - downY;
                     invalidate();
                 }
+                lastX = e.getX();
+                lastY = e.getY();
                 return true;
             case MotionEvent.ACTION_UP:
                 if (vt != null) vt.addMovement(e);
@@ -647,11 +812,7 @@ final class FlipView extends View {
                     float target = Math.abs(vx) > flingMin ? (vx < 0 ? 1f : 0f) : (t > 0.5f ? 1f : 0f);
                     animate(leaf, t, target, false);
                 } else if (mode == M_NONE) {
-                    float x = e.getX();
-                    float w = getWidth();
-                    if (x < w * 0.3f) prev();
-                    else if (x > w * 0.7f) next();
-                    else if (listener != null) listener.onTap();
+                    onTap(e.getX(), e.getY());
                 }
                 mode = M_NONE;
                 recycleVt();
@@ -663,6 +824,33 @@ final class FlipView extends View {
                 return true;
             default:
                 return true;
+        }
+    }
+
+    private void onTap(float x, float y) {
+        long now = System.currentTimeMillis();
+        boolean zoomed = zoom > 1.01f;
+        float w = getWidth();
+        boolean center = x >= w * 0.3f && x <= w * 0.7f;
+        boolean dbl2 = now - lastTapT < 320 && Math.hypot(x - lastTapX, y - lastTapY) < 60 * density
+                && (zoomed || center);
+        lastTapT = now;
+        lastTapX = x;
+        lastTapY = y;
+        if (dbl2) {
+            lastTapT = 0;
+            if (listener != null) listener.onTap(); // undo the bar toggle of the first tap
+            if (anim == null) animateZoom(zoomed ? 1f : 2.6f, x, y);
+            return;
+        }
+        if (zoomed) {
+            if (listener != null) listener.onTap();
+        } else if (x < w * 0.3f) {
+            prev();
+        } else if (x > w * 0.7f) {
+            next();
+        } else if (listener != null) {
+            listener.onTap();
         }
     }
 
